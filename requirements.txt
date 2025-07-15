@@ -1,5 +1,6 @@
+PyMuPDF
+accelerate
+numpy
+sentence-transformers
 torch
 transformers
-sentence-transformers
-PyMuPDF
-numpy
