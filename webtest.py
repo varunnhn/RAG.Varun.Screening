@@ -1,50 +1,36 @@
 import os
-import requests # New import for making HTTP requests
-from bs4 import BeautifulSoup # New import for parsing HTML
-# Updated import for HuggingFaceEmbeddings as per deprecation warning
+import requests
+from bs4 import BeautifulSoup
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-# from langchain_community.document_loaders import PyPDFLoader # No longer needed for web scraping
 from langchain_community.vectorstores import FAISS
-from langchain.text_splitter import CharacterTextSplitter
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain_community.llms import HuggingFacePipeline
 import torch
 import transformers
 from transformers import AutoTokenizer
 
-# Import for custom prompt template
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
-from langchain_core.documents import Document # Import Document for creating Langchain documents from scraped text
+from langchain_core.documents import Document
 
 
 # --- Configuration ---
-# Define the URL of the website you want to scrape
-WEBSITE_URL = "https://fossee.in/" # <--- IMPORTANT: Replace with the actual URL you want to scrape
-# For demonstration, you might want to pick a simpler page or a specific article.
-# Example: "https://en.wikipedia.org/wiki/Artificial_intelligence"
+WEBSITE_URL = "https://fossee.in/" # Target URL
 
-# Configuration for Generative LLM (Llama 3.2-1B via Hugging Face Transformers)
-# IMPORTANT: Ensure you have accepted the Llama 3.2 license on Hugging Face and run `huggingface-cli login`
-# If you have the model downloaded locally in Hugging Face format, replace with your local path:
-LLAMA_HF_MODEL_NAME = r'C:\Users\pg401\.llama\checkpoints\Llama3.2-1B' # Path to your local Llama 3.2-1B model
-
-# Configuration for Embedding Model (for Retrieval)
+LLAMA_HF_MODEL_NAME = r'C:\Users\pg401\.llama\checkpoints\Llama3.2-1B'
 EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
+FAISS_INDEX_PATH = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\faiss_index_website_content_refined' # Changed index path
 
-# Define a path to save your FAISS index for persistence
-# Using a full path
-FAISS_INDEX_PATH = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\faiss_index_website_content' # Changed path for website data
-
-# Retrieval Parameters
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-RETRIEVAL_K = 4
+CHUNK_SIZE = 700 # Slightly reduced chunk size, might fit more context in Llama's window
+CHUNK_OVERLAP = 100 # Reduced overlap slightly
+RETRIEVAL_K = 3 # Adjusted retrieval k, less noise, more focused
 
 
-# --- Helper Function for Web Scraping ---
+# --- Helper Function for Web Scraping (Enhanced) ---
 def scrape_website_content(url):
     """
-    Scrapes the text content from a given URL using requests and BeautifulSoup.
+    Scrapes the text content from a given URL using requests and BeautifulSoup,
+    focusing on main content areas.
     Returns the cleaned text content.
     """
     try:
@@ -52,20 +38,51 @@ def scrape_website_content(url):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()  # Raise an exception for HTTP errors (4xx or 5xx)
+        response = requests.get(url, headers=headers, timeout=15) # Increased timeout
+        response.raise_for_status()
 
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Remove script and style elements
-        for script_or_style in soup(['script', 'style']):
+        # Remove irrelevant elements that are not part of the main content
+        for script_or_style in soup(['script', 'style', 'header', 'footer', 'nav', 'aside', 'form', '.sidebar', '.menu', '.ads']):
             script_or_style.extract()
 
-        # Get text, strip whitespace, and join lines
-        text = soup.get_text(separator='\n', strip=True)
+        # Try to find main content areas. This is site-specific!
+        # Inspect fossee.in's HTML to find appropriate tags/classes.
+        # Common candidates: <article>, <main>, <div id="content">, <div class="main-body">, <div class="post-content">
+        # For fossee.in, looking at its structure, it's quite diverse.
+        # We'll try to get text from common text-holding tags or the body if specific sections aren't clear.
+        main_content_elements = soup.find_all(['p', 'h1', 'h2', 'h3', 'li', 'td', 'div']) # Include common text tags
+
+        # Filter out very short or clearly non-content divs if necessary
+        filtered_text_parts = []
+        for element in main_content_elements:
+            text = element.get_text(strip=True)
+            if text and len(text) > 50: # Only consider elements with substantial text
+                 # Check if the parent is also some navigation or header (heuristic)
+                is_nav_or_header_parent = False
+                current_parent = element.parent
+                while current_parent:
+                    if current_parent.name in ['nav', 'header', 'footer', 'aside'] or \
+                       ('class' in current_parent.attrs and any(c in current_parent['class'] for c in ['sidebar', 'menu'])):
+                        is_nav_or_header_parent = True
+                        break
+                    current_parent = current_parent.parent
+                if not is_nav_or_header_parent:
+                    filtered_text_parts.append(text)
+
+        if not filtered_text_parts:
+            # Fallback to getting all text if no specific content elements are found
+            text = soup.get_text(separator='\n', strip=True)
+            print("Warning: No specific main content elements found, falling back to full page text.")
+        else:
+            text = '\n\n'.join(filtered_text_parts) # Join with double newlines for better paragraph separation
 
         # Basic cleaning: remove multiple newlines
         cleaned_text = os.linesep.join([s for s in text.splitlines() if s.strip()])
+        # Further cleaning for multiple spaces
+        cleaned_text = ' '.join(cleaned_text.split())
+
         print(f"Successfully scraped content from {url}. Length: {len(cleaned_text)} characters.")
         return cleaned_text
     except requests.exceptions.RequestException as e:
@@ -88,25 +105,20 @@ if __name__ == "__main__":
 
     # --- Step 1: Web Scraping and Splitting ---
     documents = []
-    # We will re-scrape and re-process if the FAISS index doesn't exist or if you want to force an update.
-    # For a robust system, you might want to add a mechanism to check if the content has changed.
-    if not os.path.exists(FAISS_INDEX_PATH) or True: # Set to True to always re-scrape for demonstration
+    # Force re-scrape for demonstration of changes, remove `or True` for persistence
+    if not os.path.exists(FAISS_INDEX_PATH) or True:
         print("\nScraping website content (required for new FAISS index or forced refresh)...")
         scraped_text = scrape_website_content(WEBSITE_URL)
 
         if scraped_text:
-            # Create a Langchain Document object from the scraped text
-            # This is crucial for Langchain's text splitter and vector store to work correctly.
-            # You can add metadata if available, e.g., source=WEBSITE_URL
             web_document = Document(page_content=scraped_text, metadata={"source": WEBSITE_URL})
 
-            # Use CharacterTextSplitter for chunking
-            text_splitter = CharacterTextSplitter(
-                separator="\n",
+            # Use RecursiveCharacterTextSplitter for more robust chunking
+            text_splitter = RecursiveCharacterTextSplitter(
+                separators=["\n\n", "\n", " ", ""], # Try to split by larger units first
                 chunk_size=CHUNK_SIZE,
                 chunk_overlap=CHUNK_OVERLAP,
                 length_function=len,
-                is_separator_regex=False,
             )
             documents = text_splitter.split_documents([web_document])
             print(f"Scraped and split website content into {len(documents)} text chunks (chunk_size={CHUNK_SIZE}, chunk_overlap={CHUNK_OVERLAP}).")
@@ -126,7 +138,6 @@ if __name__ == "__main__":
 
         if os.path.exists(os.path.join(FAISS_INDEX_PATH, "index.faiss")) and \
            os.path.exists(os.path.join(FAISS_INDEX_PATH, "index.pkl")) and not documents:
-            # If documents list is empty but FAISS exists, it means we are loading existing.
             print(f"Loading existing FAISS index from '{FAISS_INDEX_PATH}'...")
             db = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
             print("FAISS index loaded successfully.")
@@ -170,7 +181,7 @@ if __name__ == "__main__":
         llm = HuggingFacePipeline(
             pipeline=llm_pipeline,
             model_kwargs={
-                "temperature": 0.1,
+                "temperature": 0.05,
                 "max_new_tokens": 500,
                 "do_sample": True,
                 "top_p": 0.9,
@@ -190,8 +201,9 @@ if __name__ == "__main__":
 
     system_template = (
         "You are a helpful assistant. Your task is to answer the user's question based ONLY on the provided context. "
-        "If the answer cannot be found in the given context, please state that you cannot answer based on the provided information. "
-        "Do not use any outside knowledge.\n\n"
+        "If the answer cannot be found in the given context, please state that you cannot answer based on the provided information, "
+        "and suggest asking a more specific question related to the provided context. "
+        "Do not use any outside knowledge or provide information not explicitly stated in the context.\n\n"
         "Context:\n{context}"
     )
     human_template = "{question}"
