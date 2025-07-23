@@ -21,7 +21,7 @@ LLAMA_HF_MODEL_NAME = r'C:\Users\pg401\.llama\checkpoints\Llama3.2-1B'
 EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
 FAISS_INDEX_PATH = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\faiss_index_website_content_refined' # Changed index path
 
-CHUNK_SIZE = 700 # Slightly reduced chunk size, might fit more context in Llama's window
+CHUNK_SIZE = 450 # Slightly reduced chunk size, might fit more context in Llama's window
 CHUNK_OVERLAP = 100 # Reduced overlap slightly
 RETRIEVAL_K = 3 # Adjusted retrieval k, less noise, more focused
 
@@ -200,11 +200,15 @@ if __name__ == "__main__":
     print("\nSetting up RetrievalQA chain with a custom prompt for strict context adherence...")
 
     system_template = (
-        "You are a helpful assistant. Your task is to answer the user's question based ONLY on the provided context. "
-        "If the answer cannot be found in the given context, please state that you cannot answer based on the provided information, "
-        "and suggest asking a more specific question related to the provided context. "
-        "Do not use any outside knowledge or provide information not explicitly stated in the context.\n\n"
-        "Context:\n{context}"
+       "You are an extremely concise and precise AI assistant. Your ONLY goal is to answer the user's question "
+        "by extracting information DIRECTLY from the provided context. "
+        "Do not paraphrase, rephrase, or add any information not explicitly present in the context. "
+        "Your answer should be as brief as possible while still being accurate based on the context. "
+        "If the complete answer is NOT found within the provided context, you MUST respond ONLY with: "
+        "'I cannot answer this question based on the provided information.' "
+        "Absolutely do NOT use any outside knowledge, personal opinions, or make up facts. "
+        "Prioritize brevity and directness. Do not acknowledge your role or limitations beyond the refusal statement."
+        "\n\nContext:\n{context}"
     )
     human_template = "{question}"
 
