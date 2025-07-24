@@ -271,7 +271,7 @@ if __name__ == "__main__":
     "based *solely* on the provided context. "
     "If the answer is not present or cannot be inferred from the context, state that you cannot answer. "
     "Do not use external knowledge or make up information. Be concise and to the point."
-    "Try limiting your answer to a few sentences to summarise the information provided by the context"
+    "Try limiting your answer to a few sentences to summarise the information provided by the context within 100 words"
     "\n\nContext:\n{context}\n\n"
 )
     human_template = "{question}"
