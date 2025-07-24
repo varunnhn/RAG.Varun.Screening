@@ -1,7 +1,11 @@
 import os
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+from collections import deque
+import time
 import re
+import xml.etree.ElementTree as ET # For parsing XML sitemap
 
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -16,21 +20,26 @@ import csv
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate, SystemMessagePromptTemplate
 from langchain_core.documents import Document
 
-
 # --- Configuration ---
-WEBSITE_URL = "https://fossee.in" # Target URL to scrape (only this one)
+WEBSITE_URL = "https://fossee.in"
+SITEMAP_URL = "https://fossee.in/sitemap.xml" # New: Sitemap URL
 
 LLAMA_HF_MODEL_NAME = r'C:\Users\pg401\.llama\checkpoints\Llama3.2-1B'
 EMBEDDING_MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'
-FAISS_INDEX_PATH = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\faiss_index_website_content_raw_single_page' # Adjusted index path for raw single page
-SCRAPED_DATA_CSV = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\scraped_fossee_content_raw_single_page.csv' # Adjusted CSV path for raw single page
+FAISS_INDEX_PATH = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\faiss_index_website_content_sitemap' # Updated for sitemap crawling
+SCRAPED_DATA_CSV = r'C:\Users\pg401\Varun\Programs\note-taking-app\RAG\scraped_fossee_content_sitemap.csv' # Updated for sitemap crawling
 
-CHUNK_SIZE = 700
+CHUNK_SIZE = 700 # Updated as per your request
 CHUNK_OVERLAP = 100
-RETRIEVAL_K = 3
+RETRIEVAL_K = 3 # Updated as per your request
+
+# --- Crawler Configuration ---
+MAX_CRAWL_DEPTH = 2 # How many links deep to follow from the sitemap/start URL
+MAX_PAGES_TO_CRAWL = 100 # Maximum number of unique pages to scrape from sitemap or general crawl
+CRAWL_DELAY_SECONDS = 0.5 # Delay between page requests
 
 
-# --- Helper Function for Web Scraping (SIMPLIFIED TO SCRAPE ENTIRE PAGE BODY) ---
+# --- Helper Function for Web Scraping (raw content) ---
 def scrape_website_content(url):
     """
     Scrapes the text content from a given URL with minimal filtering,
@@ -70,8 +79,128 @@ def scrape_website_content(url):
         print(f"  Error parsing HTML from {url}: {e}")
         return None
 
-# --- Function: Save Documents to CSV (Adapted for single document) ---
-# This function remains the same.
+
+# --- Function to Parse Sitemap ---
+def parse_sitemap(sitemap_url):
+    """
+    Fetches and parses a sitemap.xml file to extract all URLs.
+    Returns a set of URLs.
+    """
+    urls = set()
+    print(f"\nAttempting to fetch sitemap from: {sitemap_url}")
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(sitemap_url, headers=headers, timeout=20)
+        response.raise_for_status() # Raise an exception for HTTP errors (4xx or 5xx)
+
+        root = ET.fromstring(response.content)
+
+        # Namespace for sitemap. For sitemap.xml, it's usually http://www.sitemaps.org/schemas/sitemap/0.9
+        # Check if root tag has a namespace
+        ns_match = re.match(r'\{.*\}', root.tag)
+        ns = ns_match.group(0) if ns_match else ''
+
+        # Find all <loc> tags within <url> or <sitemap> tags
+        for url_element in root.findall(f'{ns}url'):
+            loc_element = url_element.find(f'{ns}loc')
+            if loc_element is not None:
+                urls.add(loc_element.text)
+        
+        # Handle sitemap index files (sitemap contains links to other sitemaps)
+        for sitemap_element in root.findall(f'{ns}sitemap'):
+            loc_element = sitemap_element.find(f'{ns}loc')
+            if loc_element is not None:
+                print(f"  Found nested sitemap: {loc_element.text}. Attempting to parse it...")
+                urls.update(parse_sitemap(loc_element.text)) # Recursively parse nested sitemaps
+
+        print(f"  Found {len(urls)} URLs in sitemap(s).")
+        return urls
+    except requests.exceptions.RequestException as e:
+        print(f"  Error fetching sitemap {sitemap_url}: {e}")
+        return set()
+    except ET.ParseError as e:
+        print(f"  Error parsing sitemap XML from {sitemap_url}: {e}")
+        return set()
+    except Exception as e:
+        print(f"  An unexpected error occurred while processing sitemap {sitemap_url}: {e}")
+        return set()
+
+
+# --- Web Crawler Function (Now can start from sitemap URLs) ---
+def crawl_website(start_urls, max_depth=2, max_pages=50, delay=0.5):
+    """
+    Crawls a website to collect content from multiple pages.
+    Performs a breadth-first search.
+    Can start from multiple URLs (e.g., from a sitemap).
+    Returns a list of Document objects, each representing a scraped page.
+    """
+    if not start_urls:
+        print("No start URLs provided for crawling.")
+        return []
+
+    # Get the base domain from the first start URL (assuming all are from the same domain)
+    base_domain = urlparse(list(start_urls)[0]).netloc
+    visited_urls = set()
+    urls_to_visit = deque([(url, 0) for url in start_urls]) # (url, depth)
+    scraped_documents = []
+
+    print(f"\nStarting web crawl from {len(start_urls)} initial URL(s).")
+    print(f"Max depth: {max_depth}, Max pages: {max_pages}, Delay: {delay}s")
+
+    page_count = 0
+    while urls_to_visit and page_count < max_pages:
+        current_url, depth = urls_to_visit.popleft()
+
+        if current_url in visited_urls:
+            continue
+
+        if depth > max_depth:
+            continue
+
+        # Ensure we stay within the same domain
+        if urlparse(current_url).netloc != base_domain:
+            print(f"  Skipping external link: {current_url}")
+            continue
+
+        visited_urls.add(current_url)
+        print(f"Crawling URL (Depth {depth}/{max_depth}, Scraped: {page_count}/{max_pages}): {current_url}")
+
+        # Scrape content from the current page
+        content = scrape_website_content(current_url)
+        if content: # Only add if content was successfully scraped
+            scraped_documents.append(Document(page_content=content, metadata={"source": current_url}))
+            page_count += 1 # Increment page count only for successfully scraped pages
+
+        # Find new links to add to the queue (only if within max_pages and depth)
+        if page_count < max_pages and depth < max_depth:
+            try:
+                response = requests.get(current_url, timeout=10)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for link_tag in soup.find_all('a', href=True):
+                    href = link_tag['href']
+                    absolute_url = urljoin(current_url, href).split('#')[0] # Remove fragments
+
+                    if absolute_url.startswith(('http://', 'https://')) and \
+                       urlparse(absolute_url).netloc == base_domain and \
+                       absolute_url not in visited_urls:
+                        # Filter out common file types or unwanted paths
+                        if not any(absolute_url.lower().endswith(ext) for ext in ['.pdf', '.zip', '.tar.gz', '.docx', '.pptx', '.xlsx', '.jpg', '.png', '.gif', '.mp4', '.avi', '.mov']):
+                            if not any(path_segment in absolute_url.lower() for path_segment in ['/wp-content/', '/uploads/', '/feed/', '/comment-page-', '/tag/', '/category/', '/author/']):
+                                urls_to_visit.append((absolute_url, depth + 1))
+            except requests.exceptions.RequestException as e:
+                print(f"  Error getting links from {current_url}: {e}")
+            except Exception as e:
+                print(f"  Error parsing links from {current_url}: {e}")
+
+        time.sleep(delay) # Be polite
+
+    print(f"\nFinished crawling. Scraped {len(scraped_documents)} pages.")
+    return scraped_documents
+
+
+# --- Function: Save Documents to CSV ---
 def save_documents_to_csv(documents, output_csv_path):
     """
     Saves a list of Document objects to a CSV file.
@@ -80,7 +209,7 @@ def save_documents_to_csv(documents, output_csv_path):
     """
     os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
 
-    print(f"\nSaving {len(documents)} document(s) to CSV: {output_csv_path}")
+    print(f"\nSaving {len(documents)} scraped documents to CSV: {output_csv_path}")
     if not documents:
         print("No documents to save to CSV.")
         return False
@@ -90,9 +219,9 @@ def save_documents_to_csv(documents, output_csv_path):
             fieldnames = ['content', 'source']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
-            for doc in documents: # This loop will run once for a single document
+            for doc in documents:
                 writer.writerow({'content': doc.page_content, 'source': doc.metadata.get('source', 'Unknown Source')})
-        print(f"Successfully saved content to '{output_csv_path}'.")
+        print(f"Successfully saved all scraped content to '{output_csv_path}'.")
         return True
     except IOError as e:
         print(f"Error writing to CSV file {output_csv_path}: {e}")
@@ -100,7 +229,6 @@ def save_documents_to_csv(documents, output_csv_path):
 
 
 # --- Function: Load from CSV ---
-# This function remains the same.
 def load_documents_from_csv(csv_path):
     """
     Loads documents from a CSV file.
@@ -130,33 +258,48 @@ def load_documents_from_csv(csv_path):
 # --- Main Execution ---
 if __name__ == "__main__":
     print("Starting Website RAG System with Llama 3.2-1B via Hugging Face Transformers (Langchain-based)...")
-    print(f"Target URL for scraping (single page, raw content): '{WEBSITE_URL}'")
+    print(f"Target Base URL: '{WEBSITE_URL}'")
+    print(f"Sitemap URL: '{SITEMAP_URL}'")
     print("\n*** IMPORTANT: Please ensure the following for Llama 3.2-1B model loading: ***")
     print("    1. You have accepted the Llama 3.2 license on Hugging Face (meta-llama/Llama-3.2-1B page).")
     print("    2. You have logged in to Hugging Face from your terminal using `huggingface-cli login`.")
     print("    (If loading from a local path, ensure that that path contains all HF model files including `tokenizer.model`.)")
     print("    3. You have sufficient RAM/VRAM for the Llama model (1.3B parameters requires several GBs).")
 
-    # --- Step 1: Web Scraping a single page to CSV or Loading from CSV ---
+    # --- Step 1: Web Crawling to CSV or Loading from CSV ---
     documents = []
-    FORCE_REBUILD = True # Set to True to force single page scrape and rebuild
+    # Set FORCE_REBUILD to True to ensure scraping happens every time you run
+    # For production, set to False to only rebuild if files are missing.
+    FORCE_REBUILD = True # Set to True for development to force re-scrape
 
-    # Check if we need to scrape or load from existing CSV
     if not os.path.exists(FAISS_INDEX_PATH) or not os.path.exists(SCRAPED_DATA_CSV) or FORCE_REBUILD:
-        print("\nScraping the target URL (raw content) and saving to CSV (required for new data or forced refresh)...")
-        single_page_content = scrape_website_content(WEBSITE_URL)
+        print("\nInitiating web crawling based on sitemap or default URL (required for new data or forced refresh)...")
+        
+        sitemap_urls = parse_sitemap(SITEMAP_URL)
+        
+        # If sitemap parsing fails or returns no URLs, fallback to scraping the main WEBSITE_URL
+        if not sitemap_urls:
+            print(f"Sitemap parsing failed or returned no URLs. Falling back to single-page scrape: {WEBSITE_URL}")
+            start_urls_for_crawl = {WEBSITE_URL} # Use a set to be consistent with crawl_website input
+        else:
+            print(f"Successfully parsed sitemap. Found {len(sitemap_urls)} URLs. Starting crawl.")
+            start_urls_for_crawl = sitemap_urls
 
-        if single_page_content:
-            single_doc = Document(page_content=single_page_content, metadata={"source": WEBSITE_URL})
-            scraped_docs_list = [single_doc]
+        scraped_docs = crawl_website(
+            start_urls=start_urls_for_crawl,
+            max_depth=MAX_CRAWL_DEPTH,
+            max_pages=MAX_PAGES_TO_CRAWL,
+            delay=CRAWL_DELAY_SECONDS
+        )
 
-            if save_documents_to_csv(scraped_docs_list, SCRAPED_DATA_CSV):
+        if scraped_docs:
+            if save_documents_to_csv(scraped_docs, SCRAPED_DATA_CSV):
                 documents = load_documents_from_csv(SCRAPED_DATA_CSV)
             else:
                 print("Error: Could not save scraped content to CSV. Cannot proceed with RAG.")
                 exit()
         else:
-            print("Error: Could not scrape content from the target URL. Cannot proceed with RAG.")
+            print("Error: No content scraped from the website(s). Cannot proceed with RAG.")
             exit()
     else:
         print(f"\nCSV file found at '{SCRAPED_DATA_CSV}'. Loading content from CSV...")
@@ -271,7 +414,7 @@ if __name__ == "__main__":
     "based *solely* on the provided context. "
     "If the answer is not present or cannot be inferred from the context, state that you cannot answer. "
     "Do not use external knowledge or make up information. Be concise and to the point."
-    "Try limiting your answer to a few sentences to summarise the information provided by the context within 100 words"
+
     "\n\nContext:\n{context}\n\n"
 )
     human_template = "{question}"
